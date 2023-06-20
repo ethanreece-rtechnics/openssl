@@ -3,9 +3,6 @@ name: Build
 on:
   push:
     branches: [ "master" ]
-  pull_request_target:
-    types:
-      - closed
 
 jobs:
   build32:
