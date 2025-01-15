@@ -1,5 +1,5 @@
 #! /usr/bin/env perl
-# Copyright 2007-2021 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 2007-2023 The OpenSSL Project Authors. All Rights Reserved.
 # Copyright Nokia 2007-2019
 # Copyright Siemens AG 2015-2019
 #
@@ -26,8 +26,8 @@ plan skip_all => "These tests are not supported in a fuzz build"
 
 plan skip_all => "These tests are not supported in a no-cmp build"
     if disabled("cmp");
-plan skip_all => "These tests are not supported in a no-ec build"
-    if disabled("ec");
+plan skip_all => "These tests are not supported in a no-ecx build"
+    if disabled("ecx"); # EC and EDDSA test certs, e.g., in Mock/newWithNew.pem
 plan skip_all => "These tests are not supported in a no-sock build"
     if disabled("sock");
 plan skip_all => "These tests are not supported in a no-http build"
@@ -144,7 +144,7 @@ sub test_cmp_http {
     my $title = shift;
     my $params = shift;
     my $expected_result = shift;
-    $params = [ '-server', "127.0.0.1:$server_port", @$params ]
+    $params = [ '-server', "$server_host:$server_port", @$params ]
         if ($server_name eq "Mock" && !(grep { $_ eq '-server' } @$params));
     my $cmd = app([@app, @$params]);
 
@@ -252,14 +252,15 @@ sub load_tests {
 
         next LOOP if $server_tls == 0 && $line =~ m/,\s*-tls_used\s*,/;
         my $noproxy = $no_proxy;
+        my $server_plain = $server_host =~ m/^\[(.*)\]$/ ? $1 : $server_host;
         if ($line =~ m/,\s*-no_proxy\s*,(.*?)(,|$)/) {
             $noproxy = $1;
-        } elsif ($server_host eq "127.0.0.1") {
+        } elsif ($server_plain eq "127.0.0.1" || $server_plain eq "::1") {
             # do connections to localhost (e.g., mock server) without proxy
-            $line =~ s{-section,,}{-section,,-no_proxy,127.0.0.1,} ;
+            $line =~ s{-section,,}{-section,,-no_proxy,$server_plain,} ;
         }
         if ($line =~ m/,\s*-proxy\s*,/) {
-            next LOOP if $no_proxy && ($noproxy =~ $server_host);
+            next LOOP if $no_proxy && ($noproxy =~ $server_plain);
         } else {
             $line =~ s{-section,,}{-section,,-proxy,$proxy,};
         }
@@ -277,6 +278,7 @@ sub load_tests {
         my $title = $fields[$description];
         next LOOP if (!defined($expected_result)
                       || ($expected_result ne 0 && $expected_result ne 1));
+        next LOOP if ($line =~ m/-server,\[.*:.*\]/ && !have_IPv6());
         @fields = grep {$_ ne 'BLANK'} @fields[$description + 1 .. @fields - 1];
         push @result, [$title, \@fields, $expected_result];
     }
@@ -291,33 +293,41 @@ sub start_server {
                           $args ? $args : ()]), display => 1);
     print "Current directory is ".getcwd()."\n";
     print "Launching $server_name server: $cmd\n";
-    my $pid = open($server_fh, "$cmd|");
+    my $pid = open($server_fh, "$cmd 2>".result_dir()."/error.txt |");
     unless ($pid) {
         print "Error launching $cmd, cannot obtain $server_name server PID";
         return 0;
     }
     print "$server_name server PID=$pid\n";
 
-    if ($server_port == 0) {
-        # Find out the actual server port and possibly different PID
+    if ($server_host eq '*' || $server_port == 0) {
+        # Find out the actual server host and port and possibly different PID
+        my ($host, $port);
         $pid = 0;
         while (<$server_fh>) {
             print "$server_name server output: $_";
             next if m/using section/;
             s/\R$//;                # Better chomp
-            ($server_port, $pid) = ($1, $2) if /^ACCEPT\s.*:(\d+) PID=(\d+)$/;
+            ($host, $port, $pid) = ($1, $2, $3)
+                if /^ACCEPT\s(.*?):(\d+) PID=(\d+)$/;
             last; # Do not loop further to prevent hangs on server misbehavior
         }
+        if ($server_host eq '*' && defined $host) {
+            $server_host = "[::1]"     if $host eq "[::]";
+            $server_host = "127.0.0.1" if $host eq "0.0.0.0";
+        }
+        $server_port = $port if $server_port == 0 && defined $port;
     }
-    unless ($server_port > 0) {
-        stop_server($server_name, $pid);
-        print "Cannot get expected output from the $server_name server";
+    if ($server_host eq '*' || $server_port == 0) {
+        stop_server($server_name, $pid) if $pid;
+        print "Cannot get expected output from the $server_name server\n";
         return 0;
     }
     $kur_port = $server_port if $kur_port eq "\$server_port";
     $pbm_port = $server_port if $pbm_port eq "\$server_port";
     $server_tls = $server_port if $server_tls;
     return $pid;
+
 }
 
 sub stop_server {

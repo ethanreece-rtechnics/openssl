@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2023 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2024 The OpenSSL Project Authors. All Rights Reserved.
  * Copyright (c) 2002, Oracle and/or its affiliates. All rights reserved
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
@@ -58,11 +58,12 @@ int ossl_statem_set_mutator(SSL *s,
  * send s->init_buf in records of type 'type' (SSL3_RT_HANDSHAKE or
  * SSL3_RT_CHANGE_CIPHER_SPEC)
  */
-int ssl3_do_write(SSL_CONNECTION *s, int type)
+int ssl3_do_write(SSL_CONNECTION *s, uint8_t type)
 {
     int ret;
     size_t written = 0;
     SSL *ssl = SSL_CONNECTION_GET_SSL(s);
+    SSL *ussl = SSL_CONNECTION_GET_USER_SSL(s);
 
     /*
      * If we're running the test suite then we may need to mutate the message
@@ -92,7 +93,7 @@ int ssl3_do_write(SSL_CONNECTION *s, int type)
 
     ret = ssl3_write_bytes(ssl, type, &s->init_buf->data[s->init_off],
                            s->init_num, &written);
-    if (ret < 0)
+    if (ret <= 0)
         return -1;
     if (type == SSL3_RT_HANDSHAKE)
         /*
@@ -112,7 +113,7 @@ int ssl3_do_write(SSL_CONNECTION *s, int type)
         s->statem.write_in_progress = 0;
         if (s->msg_callback)
             s->msg_callback(1, s->version, type, s->init_buf->data,
-                            (size_t)(s->init_off + s->init_num), ssl,
+                            (size_t)(s->init_off + s->init_num), ussl,
                             s->msg_callback_arg);
         return 1;
     }
@@ -156,17 +157,12 @@ int tls_setup_handshake(SSL_CONNECTION *s)
 
     /* Sanity check that we have MD5-SHA1 if we need it */
     if (sctx->ssl_digest_methods[SSL_MD_MD5_SHA1_IDX] == NULL) {
-        int md5sha1_needed = 0;
+        int negotiated_minversion;
+        int md5sha1_needed_maxversion = SSL_CONNECTION_IS_DTLS(s)
+                                        ? DTLS1_VERSION : TLS1_1_VERSION;
 
         /* We don't have MD5-SHA1 - do we need it? */
-        if (SSL_CONNECTION_IS_DTLS(s)) {
-            if (DTLS_VERSION_LE(ver_max, DTLS1_VERSION))
-                md5sha1_needed = 1;
-        } else {
-            if (ver_max <= TLS1_1_VERSION)
-                md5sha1_needed = 1;
-        }
-        if (md5sha1_needed) {
+        if (ssl_version_cmp(s, ver_max, md5sha1_needed_maxversion) <= 0) {
             SSLfatal_data(s, SSL_AD_HANDSHAKE_FAILURE,
                           SSL_R_NO_SUITABLE_DIGEST_ALGORITHM,
                           "The max supported SSL/TLS version needs the"
@@ -177,14 +173,12 @@ int tls_setup_handshake(SSL_CONNECTION *s)
         }
 
         ok = 1;
+
         /* Don't allow TLSv1.1 or below to be negotiated */
-        if (SSL_CONNECTION_IS_DTLS(s)) {
-            if (DTLS_VERSION_LT(ver_min, DTLS1_2_VERSION))
-                ok = SSL_set_min_proto_version(ssl, DTLS1_2_VERSION);
-        } else {
-            if (ver_min < TLS1_2_VERSION)
-                ok = SSL_set_min_proto_version(ssl, TLS1_2_VERSION);
-        }
+        negotiated_minversion = SSL_CONNECTION_IS_DTLS(s) ?
+                                DTLS1_2_VERSION : TLS1_2_VERSION;
+        if (ssl_version_cmp(s, ver_min, negotiated_minversion) < 0)
+                ok = SSL_set_min_proto_version(ssl, negotiated_minversion);
         if (!ok) {
             /* Shouldn't happen */
             SSLfatal(s, SSL_AD_HANDSHAKE_FAILURE, ERR_R_INTERNAL_ERROR);
@@ -204,16 +198,16 @@ int tls_setup_handshake(SSL_CONNECTION *s)
          */
         for (i = 0; i < sk_SSL_CIPHER_num(ciphers); i++) {
             const SSL_CIPHER *c = sk_SSL_CIPHER_value(ciphers, i);
+            int cipher_minprotover = SSL_CONNECTION_IS_DTLS(s)
+                                     ? c->min_dtls : c->min_tls;
+            int cipher_maxprotover = SSL_CONNECTION_IS_DTLS(s)
+                                     ? c->max_dtls : c->max_tls;
 
-            if (SSL_CONNECTION_IS_DTLS(s)) {
-                if (DTLS_VERSION_GE(ver_max, c->min_dtls) &&
-                        DTLS_VERSION_LE(ver_max, c->max_dtls))
-                    ok = 1;
-            } else if (ver_max >= c->min_tls && ver_max <= c->max_tls) {
+            if (ssl_version_cmp(s, ver_max, cipher_minprotover) >= 0
+                    && ssl_version_cmp(s, ver_max, cipher_maxprotover) <= 0) {
                 ok = 1;
-            }
-            if (ok)
                 break;
+            }
         }
         if (!ok) {
             SSLfatal_data(s, SSL_AD_HANDSHAKE_FAILURE,
@@ -523,6 +517,10 @@ MSG_PROCESS_RETURN tls_process_cert_verify(SSL_CONNECTION *s, PACKET *pkt)
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_LENGTH_MISMATCH);
         goto err;
     }
+    if (PACKET_remaining(pkt) != 0) {
+        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_LENGTH_MISMATCH);
+        goto err;
+    }
 
     if (!get_cert_verify_tbs_data(s, tls13tbs, &hdata, &hdatalen)) {
         /* SSLfatal() already called */
@@ -575,6 +573,11 @@ MSG_PROCESS_RETURN tls_process_cert_verify(SSL_CONNECTION *s, PACKET *pkt)
         }
     } else {
         j = EVP_DigestVerify(mctx, data, len, hdata, hdatalen);
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+        /* Ignore bad signatures when fuzzing */
+        if (SSL_IS_QUIC_HANDSHAKE(s))
+            j = 1;
+#endif
         if (j <= 0) {
             SSLfatal(s, SSL_AD_DECRYPT_ERROR, SSL_R_BAD_SIGNATURE);
             goto err;
@@ -615,11 +618,15 @@ CON_FUNC_RETURN tls_construct_finished(SSL_CONNECTION *s, WPACKET *pkt)
         s->statem.cleanuphand = 1;
 
     /*
-     * We only change the keys if we didn't already do this when we sent the
-     * client certificate
+     * If we attempted to write early data or we're in middlebox compat mode
+     * then we deferred changing the handshake write keys to the last possible
+     * moment. If we didn't already do this when we sent the client certificate
+     * then we need to do it now.
      */
     if (SSL_CONNECTION_IS_TLS13(s)
             && !s->server
+            && (s->early_data_state != SSL_EARLY_DATA_NONE
+                || (s->options & SSL_OP_ENABLE_MIDDLEBOX_COMPAT) != 0)
             && s->s3.tmp.cert_req == 0
             && (!ssl->method->ssl3_enc->change_cipher_state(s,
                     SSL3_CC_HANDSHAKE | SSL3_CHANGE_CIPHER_CLIENT_WRITE))) {;
@@ -806,8 +813,6 @@ MSG_PROCESS_RETURN tls_process_change_cipher_spec(SSL_CONNECTION *s,
     }
 
     if (SSL_CONNECTION_IS_DTLS(s)) {
-        dtls1_increment_epoch(s, SSL3_CC_READ);
-
         if (s->version == DTLS1_BAD_VER)
             s->d1->handshake_read_seq++;
 
@@ -1407,7 +1412,7 @@ WORK_STATE tls_finish_handshake(SSL_CONNECTION *s, ossl_unused WORK_STATE wst,
 {
     void (*cb) (const SSL *ssl, int type, int val) = NULL;
     int cleanuphand = s->statem.cleanuphand;
-    SSL *ssl = SSL_CONNECTION_GET_SSL(s);
+    SSL *ssl = SSL_CONNECTION_GET_USER_SSL(s);
     SSL_CTX *sctx = SSL_CONNECTION_GET_CTX(s);
 
     if (clearbufs) {
@@ -1419,7 +1424,7 @@ WORK_STATE tls_finish_handshake(SSL_CONNECTION *s, ossl_unused WORK_STATE wst,
              * MUST NOT be used.
              * Hence the init_buf can be cleared when DTLS over SCTP as transport is used.
              */
-            || BIO_dgram_is_sctp(SSL_get_wbio(ssl))
+            || BIO_dgram_is_sctp(SSL_get_wbio(SSL_CONNECTION_GET_SSL(s)))
 #endif
             ) {
             /*
@@ -1526,10 +1531,12 @@ WORK_STATE tls_finish_handshake(SSL_CONNECTION *s, ossl_unused WORK_STATE wst,
 int tls_get_message_header(SSL_CONNECTION *s, int *mt)
 {
     /* s->init_num < SSL3_HM_HEADER_LENGTH */
-    int skip_message, i, recvd_type;
+    int skip_message, i;
+    uint8_t recvd_type;
     unsigned char *p;
     size_t l, readbytes;
     SSL *ssl = SSL_CONNECTION_GET_SSL(s);
+    SSL *ussl = SSL_CONNECTION_GET_USER_SSL(s);
 
     p = (unsigned char *)s->init_buf->data;
 
@@ -1593,7 +1600,7 @@ int tls_get_message_header(SSL_CONNECTION *s, int *mt)
 
                     if (s->msg_callback)
                         s->msg_callback(0, s->version, SSL3_RT_HANDSHAKE,
-                                        p, SSL3_HM_HEADER_LENGTH, ssl,
+                                        p, SSL3_HM_HEADER_LENGTH, ussl,
                                         s->msg_callback_arg);
                 }
     } while (skip_message);
@@ -1638,6 +1645,7 @@ int tls_get_message_body(SSL_CONNECTION *s, size_t *len)
     unsigned char *p;
     int i;
     SSL *ssl = SSL_CONNECTION_GET_SSL(s);
+    SSL *ussl = SSL_CONNECTION_GET_USER_SSL(s);
 
     if (s->s3.tmp.message_type == SSL3_MT_CHANGE_CIPHER_SPEC) {
         /* We've already read everything in */
@@ -1679,7 +1687,7 @@ int tls_get_message_body(SSL_CONNECTION *s, size_t *len)
         }
         if (s->msg_callback)
             s->msg_callback(0, SSL2_VERSION, 0, s->init_buf->data,
-                            (size_t)s->init_num, ssl, s->msg_callback_arg);
+                            (size_t)s->init_num, ussl, s->msg_callback_arg);
     } else {
         /*
          * We defer feeding in the HRR until later. We'll do it as part of
@@ -1707,7 +1715,7 @@ int tls_get_message_body(SSL_CONNECTION *s, size_t *len)
         }
         if (s->msg_callback)
             s->msg_callback(0, s->version, SSL3_RT_HANDSHAKE, s->init_buf->data,
-                            (size_t)s->init_num + SSL3_HM_HEADER_LENGTH, ssl,
+                            (size_t)s->init_num + SSL3_HM_HEADER_LENGTH, ussl,
                             s->msg_callback_arg);
     }
 
@@ -1778,15 +1786,23 @@ int ssl_allow_compression(SSL_CONNECTION *s)
     return ssl_security(s, SSL_SECOP_COMPRESSION, 0, 0, NULL);
 }
 
-static int version_cmp(const SSL_CONNECTION *s, int a, int b)
+/*
+ * SSL/TLS/DTLS version comparison
+ *
+ * Returns
+ *      0 if versiona is equal to versionb
+ *      1 if versiona is greater than versionb
+ *     -1 if versiona is less than versionb
+ */
+int ssl_version_cmp(const SSL_CONNECTION *s, int versiona, int versionb)
 {
     int dtls = SSL_CONNECTION_IS_DTLS(s);
 
-    if (a == b)
+    if (versiona == versionb)
         return 0;
     if (!dtls)
-        return a < b ? -1 : 1;
-    return DTLS_VERSION_LT(a, b) ? -1 : 1;
+        return versiona < versionb ? -1 : 1;
+    return DTLS_VERSION_LT(versiona, versionb) ? -1 : 1;
 }
 
 typedef struct {
@@ -1863,12 +1879,12 @@ static int ssl_method_error(const SSL_CONNECTION *s, const SSL_METHOD *method)
     int version = method->version;
 
     if ((s->min_proto_version != 0 &&
-         version_cmp(s, version, s->min_proto_version) < 0) ||
+        ssl_version_cmp(s, version, s->min_proto_version) < 0) ||
         ssl_security(s, SSL_SECOP_VERSION, 0, version, NULL) == 0)
         return SSL_R_VERSION_TOO_LOW;
 
     if (s->max_proto_version != 0 &&
-        version_cmp(s, version, s->max_proto_version) > 0)
+        ssl_version_cmp(s, version, s->max_proto_version) > 0)
         return SSL_R_VERSION_TOO_HIGH;
 
     if ((s->options & method->mask) != 0)
@@ -1956,7 +1972,7 @@ int ssl_version_supported(const SSL_CONNECTION *s, int version,
     switch (SSL_CONNECTION_GET_SSL(s)->method->version) {
     default:
         /* Version should match method version for non-ANY method */
-        return version_cmp(s, version, s->version) == 0;
+        return ssl_version_cmp(s, version, s->version) == 0;
     case TLS_ANY_VERSION:
         table = tls_version_table;
         break;
@@ -1966,16 +1982,19 @@ int ssl_version_supported(const SSL_CONNECTION *s, int version,
     }
 
     for (vent = table;
-         vent->version != 0 && version_cmp(s, version, vent->version) <= 0;
+         vent->version != 0 && ssl_version_cmp(s, version, vent->version) <= 0;
          ++vent) {
-        if (vent->cmeth != NULL
-                && version_cmp(s, version, vent->version) == 0
-                && ssl_method_error(s, vent->cmeth()) == 0
+        const SSL_METHOD *(*thismeth)(void) = s->server ? vent->smeth
+                                                        : vent->cmeth;
+
+        if (thismeth != NULL
+                && ssl_version_cmp(s, version, vent->version) == 0
+                && ssl_method_error(s, thismeth()) == 0
                 && (!s->server
                     || version != TLS1_3_VERSION
                     || is_tls13_capable(s))) {
             if (meth != NULL)
-                *meth = vent->cmeth();
+                *meth = thismeth();
             return 1;
         }
     }
@@ -2143,7 +2162,7 @@ int ssl_choose_server_version(SSL_CONNECTION *s, CLIENTHELLO_MSG *hello,
     switch (server_version) {
     default:
         if (!SSL_CONNECTION_IS_TLS13(s)) {
-            if (version_cmp(s, client_version, s->version) < 0)
+            if (ssl_version_cmp(s, client_version, s->version) < 0)
                 return SSL_R_WRONG_SSL_VERSION;
             *dgrd = DOWNGRADE_NONE;
             /*
@@ -2200,7 +2219,7 @@ int ssl_choose_server_version(SSL_CONNECTION *s, CLIENTHELLO_MSG *hello,
             return SSL_R_BAD_LEGACY_VERSION;
 
         while (PACKET_get_net_2(&versionslist, &candidate_vers)) {
-            if (version_cmp(s, candidate_vers, best_vers) <= 0)
+            if (ssl_version_cmp(s, candidate_vers, best_vers) <= 0)
                 continue;
             if (ssl_version_supported(s, candidate_vers, &best_method))
                 best_vers = candidate_vers;
@@ -2235,7 +2254,7 @@ int ssl_choose_server_version(SSL_CONNECTION *s, CLIENTHELLO_MSG *hello,
      * If the supported versions extension isn't present, then the highest
      * version we can negotiate is TLSv1.2
      */
-    if (version_cmp(s, client_version, TLS1_3_VERSION) >= 0)
+    if (ssl_version_cmp(s, client_version, TLS1_3_VERSION) >= 0)
         client_version = TLS1_2_VERSION;
 
     /*
@@ -2246,7 +2265,7 @@ int ssl_choose_server_version(SSL_CONNECTION *s, CLIENTHELLO_MSG *hello,
         const SSL_METHOD *method;
 
         if (vent->smeth == NULL ||
-            version_cmp(s, client_version, vent->version) < 0)
+            ssl_version_cmp(s, client_version, vent->version) < 0)
             continue;
         method = vent->smeth();
         if (ssl_method_error(s, method) == 0) {
@@ -2334,13 +2353,8 @@ int ssl_choose_client_version(SSL_CONNECTION *s, int version,
         SSLfatal(s, SSL_AD_PROTOCOL_VERSION, ret);
         return 0;
     }
-    if (SSL_CONNECTION_IS_DTLS(s) ? DTLS_VERSION_LT(s->version, ver_min)
-                                  : s->version < ver_min) {
-        s->version = origv;
-        SSLfatal(s, SSL_AD_PROTOCOL_VERSION, SSL_R_UNSUPPORTED_PROTOCOL);
-        return 0;
-    } else if (SSL_CONNECTION_IS_DTLS(s) ? DTLS_VERSION_GT(s->version, ver_max)
-                                         : s->version > ver_max) {
+    if (ssl_version_cmp(s, s->version, ver_min) < 0
+        || ssl_version_cmp(s, s->version, ver_max) > 0) {
         s->version = origv;
         SSLfatal(s, SSL_AD_PROTOCOL_VERSION, SSL_R_UNSUPPORTED_PROTOCOL);
         return 0;
@@ -2418,7 +2432,6 @@ int ssl_get_min_max_version(const SSL_CONNECTION *s, int *min_version,
 {
     int version, tmp_real_max;
     int hole;
-    const SSL_METHOD *single = NULL;
     const SSL_METHOD *method;
     const version_info *table;
     const version_info *vent;
@@ -2460,13 +2473,12 @@ int ssl_get_min_max_version(const SSL_CONNECTION *s, int *min_version,
      * the valid protocol entries) and we don't have a selected version yet.
      *
      * Whenever "hole == 1", and we hit an enabled method, its version becomes
-     * the selected version, and the method becomes a candidate "single"
-     * method.  We're no longer in a hole, so "hole" becomes 0.
+     * the selected version.  We're no longer in a hole, so "hole" becomes 0.
      *
-     * If "hole == 0" and we hit an enabled method, then "single" is cleared,
-     * as we support a contiguous range of at least two methods.  If we hit
-     * a disabled method, then hole becomes true again, but nothing else
-     * changes yet, because all the remaining methods may be disabled too.
+     * If "hole == 0" and we hit an enabled method, we support a contiguous
+     * range of at least two methods.  If we hit a disabled method,
+     * then hole becomes true again, but nothing else changes yet,
+     * because all the remaining methods may be disabled too.
      * If we again hit an enabled method after the new hole, it becomes
      * selected, as we start from scratch.
      */
@@ -2493,12 +2505,11 @@ int ssl_get_min_max_version(const SSL_CONNECTION *s, int *min_version,
         if (ssl_method_error(s, method) != 0) {
             hole = 1;
         } else if (!hole) {
-            single = NULL;
             *min_version = method->version;
         } else {
             if (real_max != NULL && tmp_real_max != 0)
                 *real_max = tmp_real_max;
-            version = (single = method)->version;
+            version = method->version;
             *min_version = version;
             hole = 0;
         }
@@ -2851,7 +2862,7 @@ MSG_PROCESS_RETURN tls13_process_compressed_certificate(SSL_CONNECTION *sc,
             }
         }
         if (!found) {
-            SSLfatal(sc, SSL_AD_BAD_CERTIFICATE, SSL_R_BAD_COMPRESSION_ALGORITHM);
+            SSLfatal(sc, SSL_AD_ILLEGAL_PARAMETER, SSL_R_BAD_COMPRESSION_ALGORITHM);
             goto err;
         }
     }
@@ -2876,9 +2887,17 @@ MSG_PROCESS_RETURN tls13_process_compressed_certificate(SSL_CONNECTION *sc,
 
     if ((comp = COMP_CTX_new(method)) == NULL
         || !PACKET_get_net_3_len(pkt, &expected_length)
-        || !PACKET_get_net_3_len(pkt, &comp_length)
-        || PACKET_remaining(pkt) != comp_length
-        || !BUF_MEM_grow(buf, expected_length)
+        || !PACKET_get_net_3_len(pkt, &comp_length)) {
+        SSLfatal(sc, SSL_AD_BAD_CERTIFICATE, SSL_R_BAD_DECOMPRESSION);
+        goto err;
+    }
+
+    if (PACKET_remaining(pkt) != comp_length || comp_length == 0) {
+        SSLfatal(sc, SSL_AD_DECODE_ERROR, SSL_R_BAD_DECOMPRESSION);
+        goto err;
+    }
+
+    if (!BUF_MEM_grow(buf, expected_length)
         || !PACKET_buf_init(tmppkt, (unsigned char *)buf->data, expected_length)
         || COMP_expand_block(comp, (unsigned char *)buf->data, expected_length,
                              (unsigned char*)PACKET_data(pkt), comp_length) != (int)expected_length) {

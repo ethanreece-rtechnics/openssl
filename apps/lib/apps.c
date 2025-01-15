@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -48,6 +48,9 @@
 #include "s_apps.h"
 #include "apps.h"
 
+#include "internal/sockets.h" /* for openssl_fdset() */
+#include "internal/e_os.h"
+
 #ifdef _WIN32
 static int WIN32_rename(const char *from, const char *to);
 # define rename(from, to) WIN32_rename((from), (to))
@@ -75,9 +78,9 @@ typedef struct {
 } NAME_EX_TBL;
 
 static int set_table_opts(unsigned long *flags, const char *arg,
-                          const NAME_EX_TBL * in_tbl);
+                          const NAME_EX_TBL *in_tbl);
 static int set_multi_opts(unsigned long *flags, const char *arg,
-                          const NAME_EX_TBL * in_tbl);
+                          const NAME_EX_TBL *in_tbl);
 int app_init(long mesgwin);
 
 int chopup_args(ARGS *arg, char *buf)
@@ -899,7 +902,7 @@ static const char *format2string(int format)
     return NULL;
 }
 
-/* Set type expectation, but clear it if objects of different types expected. */
+/* Set type expectation, but set to 0 if objects of multiple types expected. */
 #define SET_EXPECT(val) \
     (expect = expect < 0 ? (val) : (expect == (val) ? (val) : 0))
 #define SET_EXPECT1(pvar, val) \
@@ -907,14 +910,17 @@ static const char *format2string(int format)
         *(pvar) = NULL; \
         SET_EXPECT(val); \
     }
+/* Provide (error msg) text for some of the credential types to be loaded. */
 #define FAIL_NAME \
-    (ppkey != NULL ? "key etc." : ppubkey != NULL ? "public key etc." : \
-     pparams != NULL ? "params etc." :                                  \
-     pcert != NULL ? "cert etc." : pcerts != NULL ? "certs etc." :      \
-     pcrl != NULL ? "CRL etc." : pcrls != NULL ? "CRLs etc." : NULL)
+    (ppkey != NULL ? "private key" : ppubkey != NULL ? "public key" :  \
+     pparams != NULL ? "key parameters" :                              \
+     pcert != NULL ? "certificate" : pcerts != NULL ? "certificates" : \
+     pcrl != NULL ? "CRL" : pcrls != NULL ? "CRLs" : NULL)
 /*
  * Load those types of credentials for which the result pointer is not NULL.
- * Reads from stdio if uri is NULL and maybe_stdin is nonzero.
+ * Reads from stdin if 'uri' is NULL and 'maybe_stdin' is nonzero.
+ * 'format' parameter may be FORMAT_PEM, FORMAT_ASN1, or 0 for no hint.
+ * desc may contain more detail on the credential(s) to be loaded for error msg
  * For non-NULL ppkey, pcert, and pcrl the first suitable value found is loaded.
  * If pcerts is non-NULL and *pcerts == NULL then a new cert list is allocated.
  * If pcerts is non-NULL then all available certificates are appended to *pcerts
@@ -942,24 +948,38 @@ int load_key_certs_crls(const char *uri, int format, int maybe_stdin,
     OSSL_PARAM itp[2];
     const OSSL_PARAM *params = NULL;
 
+    /* 'failed' describes type of credential to load for potential error msg */
     if (failed == NULL) {
         if (!quiet)
-            BIO_printf(bio_err, "Internal error: nothing to load from %s\n",
+            BIO_printf(bio_err, "Internal error: nothing was requested to load from %s\n",
                        uri != NULL ? uri : "<stdin>");
         return 0;
     }
+    /* suppress any extraneous errors left over from failed parse attempts */
     ERR_set_mark();
 
     SET_EXPECT1(ppkey, OSSL_STORE_INFO_PKEY);
     SET_EXPECT1(ppubkey, OSSL_STORE_INFO_PUBKEY);
     SET_EXPECT1(pparams, OSSL_STORE_INFO_PARAMS);
     SET_EXPECT1(pcert, OSSL_STORE_INFO_CERT);
+    /*
+     * Up to here, the follwing holds.
+     * If just one of the ppkey, ppubkey, pparams, and pcert function parameters
+     * is nonzero, expect > 0 indicates which type of credential is expected.
+     * If expect == 0, more than one of them is nonzero (multiple types expected).
+     */
+
     if (pcerts != NULL) {
         if (*pcerts == NULL && (*pcerts = sk_X509_new_null()) == NULL) {
             if (!quiet)
                 BIO_printf(bio_err, "Out of memory loading");
             goto end;
         }
+        /*
+         * Adapt the 'expect' variable:
+         * set to OSSL_STORE_INFO_CERT if no other type is expected so far,
+         * otherwise set to 0 (indicating that multiple types are expected).
+         */
         SET_EXPECT(OSSL_STORE_INFO_CERT);
     }
     SET_EXPECT1(pcrl, OSSL_STORE_INFO_CRL);
@@ -969,6 +989,11 @@ int load_key_certs_crls(const char *uri, int format, int maybe_stdin,
                 BIO_printf(bio_err, "Out of memory loading");
             goto end;
         }
+        /*
+         * Adapt the 'expect' variable:
+         * set to OSSL_STORE_INFO_CRL if no other type is expected so far,
+         * otherwise set to 0 (indicating that multiple types are expected).
+         */
         SET_EXPECT(OSSL_STORE_INFO_CRL);
     }
 
@@ -987,7 +1012,7 @@ int load_key_certs_crls(const char *uri, int format, int maybe_stdin,
 
         if (!maybe_stdin) {
             if (!quiet)
-                BIO_printf(bio_err, "No filename or uri specified for loading");
+                BIO_printf(bio_err, "No filename or uri specified for loading\n");
             goto end;
         }
         uri = "<stdin>";
@@ -1008,10 +1033,16 @@ int load_key_certs_crls(const char *uri, int format, int maybe_stdin,
             BIO_printf(bio_err, "Could not open file or uri for loading");
         goto end;
     }
-    if (expect > 0 && !OSSL_STORE_expect(ctx, expect))
+    /* expect == 0 means here multiple types of credentials are to be loaded */
+    if (expect > 0 && !OSSL_STORE_expect(ctx, expect)) {
+        if (!quiet)
+            BIO_printf(bio_err, "Internal error trying to load");
         goto end;
+    }
 
     failed = NULL;
+    /* from here, failed != NULL only if actually an error has been detected */
+
     while ((ppkey != NULL || ppubkey != NULL || pparams != NULL
             || pcert != NULL || pcerts != NULL || pcrl != NULL || pcrls != NULL)
            && !OSSL_STORE_eof(ctx)) {
@@ -1081,7 +1112,7 @@ int load_key_certs_crls(const char *uri, int format, int maybe_stdin,
             ncrls += ok;
             break;
         default:
-            /* skip any other type */
+            /* skip any other type; ok stays == 1 */
             break;
         }
         OSSL_STORE_INFO_free(info);
@@ -1095,20 +1126,22 @@ int load_key_certs_crls(const char *uri, int format, int maybe_stdin,
 
  end:
     OSSL_STORE_close(ctx);
-    if (ncerts > 0)
-        pcerts = NULL;
-    if (ncrls > 0)
-        pcrls = NULL;
+
+    /* see if any of the requested types of credentials was not found */
     if (failed == NULL) {
+        if (ncerts > 0)
+            pcerts = NULL;
+        if (ncrls > 0)
+            pcrls = NULL;
         failed = FAIL_NAME;
         if (failed != NULL && !quiet)
             BIO_printf(bio_err, "Could not find");
-    } else if (!quiet) {
-        BIO_printf(bio_err, "Could not read");
     }
+
     if (failed != NULL && !quiet) {
         unsigned long err = ERR_peek_last_error();
 
+        /* continue the error message with the type of credential affected */
         if (desc != NULL && strstr(desc, failed) != NULL) {
             BIO_printf(bio_err, " %s", desc);
         } else {
@@ -1273,7 +1306,7 @@ int copy_extensions(X509 *x, X509_REQ *req, int copy_type)
 }
 
 static int set_multi_opts(unsigned long *flags, const char *arg,
-                          const NAME_EX_TBL * in_tbl)
+                          const NAME_EX_TBL *in_tbl)
 {
     STACK_OF(CONF_VALUE) *vals;
     CONF_VALUE *val;
@@ -1292,7 +1325,7 @@ static int set_multi_opts(unsigned long *flags, const char *arg,
 }
 
 static int set_table_opts(unsigned long *flags, const char *arg,
-                          const NAME_EX_TBL * in_tbl)
+                          const NAME_EX_TBL *in_tbl)
 {
     char c;
     const NAME_EX_TBL *ptbl;
@@ -1569,9 +1602,9 @@ int save_serial(const char *serialfile, const char *suffix,
         OPENSSL_strlcpy(buf[0], serialfile, BSIZE);
     } else {
 #ifndef OPENSSL_SYS_VMS
-        j = BIO_snprintf(buf[0], sizeof(buf[0]), "%s.%s", serialfile, suffix);
+        BIO_snprintf(buf[0], sizeof(buf[0]), "%s.%s", serialfile, suffix);
 #else
-        j = BIO_snprintf(buf[0], sizeof(buf[0]), "%s-%s", serialfile, suffix);
+        BIO_snprintf(buf[0], sizeof(buf[0]), "%s-%s", serialfile, suffix);
 #endif
     }
     out = BIO_new_file(buf[0], "w");
@@ -1613,11 +1646,11 @@ int rotate_serial(const char *serialfile, const char *new_suffix,
         goto err;
     }
 #ifndef OPENSSL_SYS_VMS
-    j = BIO_snprintf(buf[0], sizeof(buf[0]), "%s.%s", serialfile, new_suffix);
-    j = BIO_snprintf(buf[1], sizeof(buf[1]), "%s.%s", serialfile, old_suffix);
+    BIO_snprintf(buf[0], sizeof(buf[0]), "%s.%s", serialfile, new_suffix);
+    BIO_snprintf(buf[1], sizeof(buf[1]), "%s.%s", serialfile, old_suffix);
 #else
-    j = BIO_snprintf(buf[0], sizeof(buf[0]), "%s-%s", serialfile, new_suffix);
-    j = BIO_snprintf(buf[1], sizeof(buf[1]), "%s-%s", serialfile, old_suffix);
+    BIO_snprintf(buf[0], sizeof(buf[0]), "%s-%s", serialfile, new_suffix);
+    BIO_snprintf(buf[1], sizeof(buf[1]), "%s-%s", serialfile, old_suffix);
 #endif
     if (rename(serialfile, buf[1]) < 0 && errno != ENOENT
 #ifdef ENOTDIR
@@ -1769,13 +1802,13 @@ int save_index(const char *dbfile, const char *suffix, CA_DB *db)
         goto err;
     }
 #ifndef OPENSSL_SYS_VMS
-    j = BIO_snprintf(buf[2], sizeof(buf[2]), "%s.attr", dbfile);
-    j = BIO_snprintf(buf[1], sizeof(buf[1]), "%s.attr.%s", dbfile, suffix);
-    j = BIO_snprintf(buf[0], sizeof(buf[0]), "%s.%s", dbfile, suffix);
+    BIO_snprintf(buf[2], sizeof(buf[2]), "%s.attr", dbfile);
+    BIO_snprintf(buf[1], sizeof(buf[1]), "%s.attr.%s", dbfile, suffix);
+    BIO_snprintf(buf[0], sizeof(buf[0]), "%s.%s", dbfile, suffix);
 #else
-    j = BIO_snprintf(buf[2], sizeof(buf[2]), "%s-attr", dbfile);
-    j = BIO_snprintf(buf[1], sizeof(buf[1]), "%s-attr-%s", dbfile, suffix);
-    j = BIO_snprintf(buf[0], sizeof(buf[0]), "%s-%s", dbfile, suffix);
+    BIO_snprintf(buf[2], sizeof(buf[2]), "%s-attr", dbfile);
+    BIO_snprintf(buf[1], sizeof(buf[1]), "%s-attr-%s", dbfile, suffix);
+    BIO_snprintf(buf[0], sizeof(buf[0]), "%s-%s", dbfile, suffix);
 #endif
     out = BIO_new_file(buf[0], "w");
     if (out == NULL) {
@@ -1819,17 +1852,17 @@ int rotate_index(const char *dbfile, const char *new_suffix,
         goto err;
     }
 #ifndef OPENSSL_SYS_VMS
-    j = BIO_snprintf(buf[4], sizeof(buf[4]), "%s.attr", dbfile);
-    j = BIO_snprintf(buf[3], sizeof(buf[3]), "%s.attr.%s", dbfile, old_suffix);
-    j = BIO_snprintf(buf[2], sizeof(buf[2]), "%s.attr.%s", dbfile, new_suffix);
-    j = BIO_snprintf(buf[1], sizeof(buf[1]), "%s.%s", dbfile, old_suffix);
-    j = BIO_snprintf(buf[0], sizeof(buf[0]), "%s.%s", dbfile, new_suffix);
+    BIO_snprintf(buf[4], sizeof(buf[4]), "%s.attr", dbfile);
+    BIO_snprintf(buf[3], sizeof(buf[3]), "%s.attr.%s", dbfile, old_suffix);
+    BIO_snprintf(buf[2], sizeof(buf[2]), "%s.attr.%s", dbfile, new_suffix);
+    BIO_snprintf(buf[1], sizeof(buf[1]), "%s.%s", dbfile, old_suffix);
+    BIO_snprintf(buf[0], sizeof(buf[0]), "%s.%s", dbfile, new_suffix);
 #else
-    j = BIO_snprintf(buf[4], sizeof(buf[4]), "%s-attr", dbfile);
-    j = BIO_snprintf(buf[3], sizeof(buf[3]), "%s-attr-%s", dbfile, old_suffix);
-    j = BIO_snprintf(buf[2], sizeof(buf[2]), "%s-attr-%s", dbfile, new_suffix);
-    j = BIO_snprintf(buf[1], sizeof(buf[1]), "%s-%s", dbfile, old_suffix);
-    j = BIO_snprintf(buf[0], sizeof(buf[0]), "%s-%s", dbfile, new_suffix);
+    BIO_snprintf(buf[4], sizeof(buf[4]), "%s-attr", dbfile);
+    BIO_snprintf(buf[3], sizeof(buf[3]), "%s-attr-%s", dbfile, old_suffix);
+    BIO_snprintf(buf[2], sizeof(buf[2]), "%s-attr-%s", dbfile, new_suffix);
+    BIO_snprintf(buf[1], sizeof(buf[1]), "%s-%s", dbfile, old_suffix);
+    BIO_snprintf(buf[0], sizeof(buf[0]), "%s-%s", dbfile, new_suffix);
 #endif
     if (rename(dbfile, buf[1]) < 0 && errno != ENOENT
 #ifdef ENOTDIR
@@ -1980,16 +2013,17 @@ X509_NAME *parse_name(const char *cp, int chtype, int canmulti,
         nid = OBJ_txt2nid(typestr);
         if (nid == NID_undef) {
             BIO_printf(bio_err,
-                       "%s: Skipping unknown %s name attribute \"%s\"\n",
+                       "%s warning: Skipping unknown %s name attribute \"%s\"\n",
                        opt_getprog(), desc, typestr);
             if (ismulti)
                 BIO_printf(bio_err,
-                           "Hint: a '+' in a value string needs be escaped using '\\' else a new member of a multi-valued RDN is expected\n");
+                           "%s hint: a '+' in a value string needs be escaped using '\\' else a new member of a multi-valued RDN is expected\n",
+                           opt_getprog());
             continue;
         }
         if (*valstr == '\0') {
             BIO_printf(bio_err,
-                       "%s: No value provided for %s name attribute \"%s\", skipped\n",
+                       "%s warning: No value provided for %s name attribute \"%s\", skipped\n",
                        opt_getprog(), desc, typestr);
             continue;
         }
@@ -2043,7 +2077,8 @@ int bio_to_mem(unsigned char **out, int maxlen, BIO *in)
             BIO_free(mem);
             return -1;
         }
-        maxlen -= len;
+        if (maxlen != -1)
+            maxlen -= len;
 
         if (maxlen == 0)
             break;
@@ -2181,7 +2216,7 @@ int check_cert_attributes(BIO *bio, X509 *x, const char *checkhost,
         if (print)
             BIO_printf(bio, "Hostname %s does%s match certificate\n",
                        checkhost, valid_host == 1 ? "" : " NOT");
-        ret = ret && valid_host;
+        ret = ret && valid_host > 0;
     }
 
     if (checkemail != NULL) {
@@ -2189,7 +2224,7 @@ int check_cert_attributes(BIO *bio, X509 *x, const char *checkhost,
         if (print)
             BIO_printf(bio, "Email %s does%s match certificate\n",
                        checkemail, valid_mail ? "" : " NOT");
-        ret = ret && valid_mail;
+        ret = ret && valid_mail > 0;
     }
 
     if (checkip != NULL) {
@@ -2197,7 +2232,7 @@ int check_cert_attributes(BIO *bio, X509 *x, const char *checkhost,
         if (print)
             BIO_printf(bio, "IP %s does%s match certificate\n",
                        checkip, valid_ip ? "" : " NOT");
-        ret = ret && valid_ip;
+        ret = ret && valid_ip > 0;
     }
 
     return ret;
@@ -2949,11 +2984,6 @@ int raw_read_stdin(void *buf, int siz)
     return recv(fileno_stdin(), buf, siz, 0);
 }
 #else
-# if defined(__TANDEM)
-#  if defined(OPENSSL_TANDEM_FLOSS)
-#   include <floss.h(floss_read)>
-#  endif
-# endif
 int raw_read_stdin(void *buf, int siz)
 {
     return read(fileno_stdin(), buf, siz);
@@ -2972,21 +3002,11 @@ int raw_write_stdout(const void *buf, int siz)
 }
 #elif defined(OPENSSL_SYS_TANDEM) && defined(OPENSSL_THREADS) \
     && defined(_SPT_MODEL_)
-# if defined(__TANDEM)
-#  if defined(OPENSSL_TANDEM_FLOSS)
-#   include <floss.h(floss_write)>
-#  endif
-# endif
 int raw_write_stdout(const void *buf, int siz)
 {
     return write(fileno(stdout), (void *)buf, siz);
 }
 #else
-# if defined(__TANDEM)
-#  if defined(OPENSSL_TANDEM_FLOSS)
-#   include <floss.h(floss_write)>
-#  endif
-# endif
 int raw_write_stdout(const void *buf, int siz)
 {
     return write(fileno_stdout(), buf, siz);
@@ -3205,6 +3225,32 @@ BIO *bio_open_default_quiet(const char *filename, char mode, int format)
     return bio_open_default_(filename, mode, format, 1);
 }
 
+int mem_bio_to_file(BIO *in, const char *filename, int format, int private)
+{
+    int rv = 0, ret = 0;
+    BIO *out = NULL;
+    BUF_MEM *mem_buffer = NULL;
+
+    rv = BIO_get_mem_ptr(in, &mem_buffer);
+    if (rv <= 0) {
+        BIO_puts(bio_err, "Error reading mem buffer\n");
+        goto end;
+    }
+    out = bio_open_owner(filename, format, private);
+    if (out == NULL)
+        goto end;
+    rv = BIO_write(out, mem_buffer->data, mem_buffer->length);
+    if (rv < 0 || (size_t)rv != mem_buffer->length)
+        BIO_printf(bio_err, "Error writing to output file: '%s'\n", filename);
+    else
+        ret = 1;
+end:
+    if (!ret)
+        ERR_print_errors(bio_err);
+    BIO_free_all(out);
+    return ret;
+}
+
 void wait_for_async(SSL *s)
 {
     /* On Windows select only works for sockets, so we simply don't wait  */
@@ -3272,22 +3318,53 @@ void corrupt_signature(const ASN1_STRING *signature)
     s[signature->length - 1] ^= 0x1;
 }
 
-int set_cert_times(X509 *x, const char *startdate, const char *enddate,
-                   int days)
+int check_cert_time_string(const char *time, const char *desc)
 {
+    if (time == NULL || strcmp(time, "today") == 0
+            || ASN1_TIME_set_string_X509(NULL, time))
+        return 1;
+    BIO_printf(bio_err,
+               "%s is invalid, it should be \"today\" or have format [CC]YYMMDDHHMMSSZ\n",
+               desc);
+    return 0;
+}
+
+int set_cert_times(X509 *x, const char *startdate, const char *enddate,
+                   int days, int strict_compare_times)
+{
+    if (!check_cert_time_string(startdate, "start date"))
+        return 0;
+    if (!check_cert_time_string(enddate, "end date"))
+        return 0;
     if (startdate == NULL || strcmp(startdate, "today") == 0) {
-        if (X509_gmtime_adj(X509_getm_notBefore(x), 0) == NULL)
+        if (X509_gmtime_adj(X509_getm_notBefore(x), 0) == NULL) {
+            BIO_printf(bio_err, "Error setting notBefore certificate field\n");
             return 0;
+        }
     } else {
-        if (!ASN1_TIME_set_string_X509(X509_getm_notBefore(x), startdate))
+        if (!ASN1_TIME_set_string_X509(X509_getm_notBefore(x), startdate)) {
+            BIO_printf(bio_err, "Error setting notBefore certificate field\n");
             return 0;
+        }
+    }
+    if (enddate != NULL && strcmp(enddate, "today") == 0) {
+        enddate = NULL;
+        days = 0;
     }
     if (enddate == NULL) {
-        if (X509_time_adj_ex(X509_getm_notAfter(x), days, 0, NULL)
-            == NULL)
+        if (X509_time_adj_ex(X509_getm_notAfter(x), days, 0, NULL) == NULL) {
+            BIO_printf(bio_err, "Error setting notAfter certificate field\n");
             return 0;
+        }
     } else if (!ASN1_TIME_set_string_X509(X509_getm_notAfter(x), enddate)) {
+        BIO_printf(bio_err, "Error setting notAfter certificate field\n");
         return 0;
+    }
+    if (ASN1_TIME_compare(X509_get0_notAfter(x), X509_get0_notBefore(x)) < 0) {
+        BIO_printf(bio_err, "%s: end date before start date\n",
+                   strict_compare_times ? "Error" : "Warning");
+        if (strict_compare_times)
+            return 0;
     }
     return 1;
 }
@@ -3418,8 +3495,8 @@ EVP_PKEY *app_keygen(EVP_PKEY_CTX *ctx, const char *alg, int bits, int verbose)
         BIO_printf(bio_err, "Warning: generating random key material may take a long time\n"
                    "if the system has a poor entropy source\n");
     if (EVP_PKEY_keygen(ctx, &res) <= 0)
-        app_bail_out("%s: Error generating %s key\n", opt_getprog(),
-                     alg != NULL ? alg : "asymmetric");
+        BIO_printf(bio_err, "%s: Error generating %s key\n", opt_getprog(),
+                   alg != NULL ? alg : "asymmetric");
     return res;
 }
 
@@ -3431,8 +3508,8 @@ EVP_PKEY *app_paramgen(EVP_PKEY_CTX *ctx, const char *alg)
         BIO_printf(bio_err, "Warning: generating random key parameters may take a long time\n"
                    "if the system has a poor entropy source\n");
     if (EVP_PKEY_paramgen(ctx, &res) <= 0)
-        app_bail_out("%s: Generating %s key parameters failed\n",
-                     opt_getprog(), alg != NULL ? alg : "asymmetric");
+        BIO_printf(bio_err, "%s: Generating %s key parameters failed\n",
+                   opt_getprog(), alg != NULL ? alg : "asymmetric");
     return res;
 }
 
@@ -3445,6 +3522,7 @@ int opt_legacy_okay(void)
 {
     int provider_options = opt_provider_option_given();
     int libctx = app_get0_libctx() != NULL || app_get0_propq() != NULL;
+
     /*
      * Having a provider option specified or a custom library context or
      * property query, is a sure sign we're not using legacy.

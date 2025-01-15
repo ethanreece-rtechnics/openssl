@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -150,10 +150,6 @@ int dsaparam_main(int argc, char **argv)
     numbits = num;
     private = genkey ? 1 : 0;
 
-    out = bio_open_owner(outfile, outformat, private);
-    if (out == NULL)
-        goto end;
-
     ctx = EVP_PKEY_CTX_new_from_name(app_get0_libctx(), "DSA", app_get0_propq());
     if (ctx == NULL) {
         BIO_printf(bio_err,
@@ -200,6 +196,10 @@ int dsaparam_main(int argc, char **argv)
         goto end;
     }
 
+    out = bio_open_owner(outfile, outformat, private);
+    if (out == NULL)
+        goto end;
+
     if (text) {
         EVP_PKEY_print_params(out, params, 0, NULL);
     }
@@ -232,6 +232,8 @@ int dsaparam_main(int argc, char **argv)
             goto end;
         }
         pkey = app_keygen(ctx, "DSA", numbits, verbose);
+        if (pkey == NULL)
+            goto end;
         assert(private);
         if (outformat == FORMAT_ASN1)
             i = i2d_PrivateKey_bio(out, pkey);

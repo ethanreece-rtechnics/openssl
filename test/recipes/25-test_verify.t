@@ -1,5 +1,5 @@
 #! /usr/bin/env perl
-# Copyright 2015-2021 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 2015-2023 The OpenSSL Project Authors. All Rights Reserved.
 #
 # Licensed under the Apache License 2.0 (the "License").  You may not use
 # this file except in compliance with the License.  You can obtain a copy
@@ -29,7 +29,7 @@ sub verify {
     run(app([@args]));
 }
 
-plan tests => 185;
+plan tests => 193;
 
 # Canonical success
 ok(verify("ee-cert", "sslserver", ["root-cert"], ["ca-cert"]),
@@ -61,7 +61,7 @@ ok(verify("ee-cert-ocsp-nocheck", "", ["root-cert"], ["ca-cert"]),
 ok(verify("ee-cert", "sslserver", [qw(sroot-cert)], [qw(ca-cert)]),
    "accept server purpose");
 ok(!verify("ee-cert", "sslserver", [qw(croot-cert)], [qw(ca-cert)]),
-   "fail client purpose");
+   "fail client purpose"); # beware, questionable non-standard EKU check on trust anchor
 ok(verify("ee-cert", "sslserver", [qw(root+serverAuth)], [qw(ca-cert)]),
    "accept server trust");
 ok(verify("ee-cert", "sslserver", [qw(sroot+serverAuth)], [qw(ca-cert)]),
@@ -81,7 +81,7 @@ ok(verify("ee-cert", "sslserver", [qw(root-clientAuth)], [qw(ca-cert)]),
 ok(verify("ee-cert", "sslserver", [qw(sroot-clientAuth)], [qw(ca-cert)]),
    "accept client mistrust with server purpose");
 ok(!verify("ee-cert", "sslserver", [qw(croot-clientAuth)], [qw(ca-cert)]),
-   "fail client mistrust with client purpose");
+   "fail client mistrust with client purpose"); # beware, questionable non-standard EKU check on trust anchor
 # Inapplicable trust
 ok(!verify("ee-cert", "sslserver", [qw(root+clientAuth)], [qw(ca-cert)]),
    "fail client trust");
@@ -150,7 +150,7 @@ ok(!verify("ee-cert", "sslserver", [qw(root-expired)], [qw(ca-cert)]),
 ok(verify("ee-cert", "sslserver", [qw(sca-cert)], [], "-partial_chain"),
    "accept partial chain with server purpose");
 ok(!verify("ee-cert", "sslserver", [qw(cca-cert)], [], "-partial_chain"),
-   "fail partial chain with client purpose");
+   "fail partial chain with client purpose"); # beware, questionable non-standard EKU check on trust anchor
 ok(verify("ee-cert", "sslserver", [qw(ca+serverAuth)], [], "-partial_chain"),
    "accept server trust partial chain");
 ok(verify("ee-cert", "sslserver", [qw(cca+serverAuth)], [], "-partial_chain"),
@@ -188,7 +188,7 @@ ok(verify("ee-cert", "sslserver", [qw(root-cert cca+serverAuth)], [qw(ca-cert)])
 ok(verify("ee-cert", "sslserver", [qw(root-cert cca+anyEKU)], [qw(ca-cert)]),
    "accept wildcard trust and client purpose");
 ok(!verify("ee-cert", "sslserver", [qw(root-cert cca-cert)], [qw(ca-cert)]),
-   "fail client purpose");
+   "fail client purpose intermediate trusted"); # beware, questionable non-standard EKU check on trust anchor
 ok(!verify("ee-cert", "sslserver", [qw(root-cert ca-anyEKU)], [qw(ca-cert)]),
    "fail wildcard mistrust");
 ok(!verify("ee-cert", "sslserver", [qw(root-cert ca-serverAuth)], [qw(ca-cert)]),
@@ -339,7 +339,7 @@ ok(!verify("ee-cert-md5", "", ["root-cert"], ["ca-cert"]),
 
 # Explicit vs named curve tests
 SKIP: {
-    skip "EC is not supported by this OpenSSL build", 3
+    skip "EC is not supported by this OpenSSL build", 7
         if disabled("ec");
     ok(!verify("ee-cert-ec-explicit", "", ["root-cert"],
                ["ca-cert-ec-named"]),
@@ -350,6 +350,14 @@ SKIP: {
     ok(verify("ee-cert-ec-named-named", "", ["root-cert"],
               ["ca-cert-ec-named"]),
         "accept named curve leaf with named curve intermediate");
+    ok(verify("ee-cert-ec-sha3-224", "", ["root-cert"], ["ca-cert-ec-named"], ),
+        "accept cert generated with EC and SHA3-224");
+    ok(verify("ee-cert-ec-sha3-256", "", ["root-cert"], ["ca-cert-ec-named"], ),
+        "accept cert generated with EC and SHA3-256");
+    ok(verify("ee-cert-ec-sha3-384", "", ["root-cert"], ["ca-cert-ec-named"], ),
+        "accept cert generated with EC and SHA3-384");
+    ok(verify("ee-cert-ec-sha3-512", "", ["root-cert"], ["ca-cert-ec-named"], ),
+        "accept cert generated with EC and SHA3-512");
 }
 # Same as above but with base provider used for decoding
 SKIP: {
@@ -358,8 +366,21 @@ SKIP: {
     my $provpath = bldtop_dir("providers");
     my @prov = ("-provider-path", $provpath);
 
-    skip "EC is not supported or FIPS is disabled", 3
+    skip "EC is not supported or FIPS is disabled", 7
         if disabled("ec") || $no_fips;
+
+    $ENV{OPENSSL_CONF} = $provconf;
+
+    ok(verify("ee-cert-ec-sha3-224", "", ["root-cert"], ["ca-cert-ec-named"], @prov),
+        "accept cert generated with EC and SHA3-224 w/fips");
+    ok(verify("ee-cert-ec-sha3-256", "", ["root-cert"], ["ca-cert-ec-named"], @prov),
+        "accept cert generated with EC and SHA3-256 w/fips");
+    ok(verify("ee-cert-ec-sha3-384", "", ["root-cert"], ["ca-cert-ec-named"], @prov),
+        "accept cert generated with EC and SHA3-384 w/fips");
+    ok(verify("ee-cert-ec-sha3-512", "", ["root-cert"], ["ca-cert-ec-named"], @prov),
+        "accept cert generated with EC and SHA3-512 w/fips");
+
+    delete $ENV{OPENSSL_CONF};
 
     run(test(["fips_version_test", "-config", $provconf, ">3.0.0"]),
              capture => 1, statusvar => \my $exit);
@@ -377,7 +398,6 @@ SKIP: {
     ok(verify("ee-cert-ec-named-named", "", ["root-cert"],
               ["ca-cert-ec-named"], @prov),
         "accept named curve leaf with named curve intermediate w/fips");
-
     delete $ENV{OPENSSL_CONF};
 }
 

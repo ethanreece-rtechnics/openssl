@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2022-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -15,6 +15,7 @@
 # include "internal/quic_stream.h"
 # include "internal/quic_channel.h"
 # include "internal/statem.h"
+# include "internal/time.h"
 
 # ifndef OPENSSL_NO_QUIC
 
@@ -36,9 +37,12 @@ typedef struct quic_tserver_st QUIC_TSERVER;
 typedef struct quic_tserver_args_st {
     OSSL_LIB_CTX *libctx;
     const char *propq;
+    SSL_CTX *ctx;
     BIO *net_rbio, *net_wbio;
     OSSL_TIME (*now_cb)(void *arg);
     void *now_cb_arg;
+    const unsigned char *alpn;
+    size_t alpnlen;
 } QUIC_TSERVER_ARGS;
 
 QUIC_TSERVER *ossl_quic_tserver_new(const QUIC_TSERVER_ARGS *args,
@@ -129,6 +133,8 @@ int ossl_quic_tserver_stream_new(QUIC_TSERVER *srv,
 
 BIO *ossl_quic_tserver_get0_rbio(QUIC_TSERVER *srv);
 
+SSL_CTX *ossl_quic_tserver_get0_ssl_ctx(QUIC_TSERVER *srv);
+
 /*
  * Returns 1 if the peer has sent a STOP_SENDING frame for a stream.
  * app_error_code is written if this returns 1.
@@ -156,6 +162,58 @@ int ossl_quic_tserver_set_new_local_cid(QUIC_TSERVER *srv,
  * currently is none.
  */
 uint64_t ossl_quic_tserver_pop_incoming_stream(QUIC_TSERVER *srv);
+
+/*
+ * Returns 1 if all data sent on the given stream_id has been acked by the peer.
+ */
+int ossl_quic_tserver_is_stream_totally_acked(QUIC_TSERVER *srv,
+                                              uint64_t stream_id);
+
+/* Returns 1 if we are currently interested in reading data from the network */
+int ossl_quic_tserver_get_net_read_desired(QUIC_TSERVER *srv);
+
+/* Returns 1 if we are currently interested in writing data to the network */
+int ossl_quic_tserver_get_net_write_desired(QUIC_TSERVER *srv);
+
+/* Returns the next event deadline */
+OSSL_TIME ossl_quic_tserver_get_deadline(QUIC_TSERVER *srv);
+
+/*
+ * Shutdown the QUIC connection. Returns 1 if the connection is terminated and
+ * 0 otherwise.
+ */
+int ossl_quic_tserver_shutdown(QUIC_TSERVER *srv, uint64_t app_error_code);
+
+/* Force generation of an ACK-eliciting packet. */
+int ossl_quic_tserver_ping(QUIC_TSERVER *srv);
+
+/* Set tracing callback on channel. */
+void ossl_quic_tserver_set_msg_callback(QUIC_TSERVER *srv,
+                                        void (*f)(int write_p, int version,
+                                                  int content_type,
+                                                  const void *buf, size_t len,
+                                                  SSL *ssl, void *arg),
+                                        void *arg);
+
+/*
+ * This is similar to ossl_quic_conn_get_channel; it should be used for test
+ * instrumentation only and not to bypass QUIC_TSERVER for 'normal' operations.
+ */
+QUIC_CHANNEL *ossl_quic_tserver_get_channel(QUIC_TSERVER *srv);
+
+/* Send a TLS new session ticket */
+int ossl_quic_tserver_new_ticket(QUIC_TSERVER *srv);
+
+/*
+ * Set the max_early_data value to be sent in NewSessionTickets. Only the
+ * values 0 and 0xffffffff are valid for use in QUIC.
+ */
+int ossl_quic_tserver_set_max_early_data(QUIC_TSERVER *srv,
+                                         uint32_t max_early_data);
+
+/* Set the find session callback for getting a server PSK */
+void ossl_quic_tserver_set_psk_find_session_cb(QUIC_TSERVER *srv,
+                                               SSL_psk_find_session_cb_func cb);
 
 # endif
 

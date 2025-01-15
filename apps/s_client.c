@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2023 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2024 The OpenSSL Project Authors. All Rights Reserved.
  * Copyright 2005 Nokia. All rights reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <openssl/e_os2.h>
 #include "internal/nelem.h"
+#include "internal/sockets.h" /* for openssl_fdset() */
 
 #ifndef OPENSSL_NO_SOCK
 
@@ -55,7 +56,7 @@ typedef unsigned int u_int;
 #endif
 
 #undef BUFSIZZ
-#define BUFSIZZ 1024*8
+#define BUFSIZZ 1024*16
 #define S_CLIENT_IRC_READ_TIMEOUT 8
 
 #define USER_DATA_MODE_NONE     0
@@ -1285,9 +1286,7 @@ int s_client_main(int argc, char **argv)
 #ifndef OPENSSL_NO_DTLS
             isdtls = 0;
 #endif
-#ifndef OPENSS_NO_QUIC
             isquic = 0;
-#endif
             break;
         case OPT_TLS1_3:
             min_version = TLS1_3_VERSION;
@@ -1296,9 +1295,7 @@ int s_client_main(int argc, char **argv)
 #ifndef OPENSSL_NO_DTLS
             isdtls = 0;
 #endif
-#ifndef OPENSS_NO_QUIC
             isquic = 0;
-#endif
             break;
         case OPT_TLS1_2:
             min_version = TLS1_2_VERSION;
@@ -1307,9 +1304,7 @@ int s_client_main(int argc, char **argv)
 #ifndef OPENSSL_NO_DTLS
             isdtls = 0;
 #endif
-#ifndef OPENSS_NO_QUIC
             isquic = 0;
-#endif
             break;
         case OPT_TLS1_1:
             min_version = TLS1_1_VERSION;
@@ -1318,9 +1313,7 @@ int s_client_main(int argc, char **argv)
 #ifndef OPENSSL_NO_DTLS
             isdtls = 0;
 #endif
-#ifndef OPENSS_NO_QUIC
             isquic = 0;
-#endif
             break;
         case OPT_TLS1:
             min_version = TLS1_VERSION;
@@ -1329,18 +1322,14 @@ int s_client_main(int argc, char **argv)
 #ifndef OPENSSL_NO_DTLS
             isdtls = 0;
 #endif
-#ifndef OPENSS_NO_QUIC
             isquic = 0;
-#endif
             break;
         case OPT_DTLS:
 #ifndef OPENSSL_NO_DTLS
             meth = DTLS_client_method();
             socket_type = SOCK_DGRAM;
             isdtls = 1;
-# ifndef OPENSS_NO_QUIC
             isquic = 0;
-# endif
 #endif
             break;
         case OPT_DTLS1:
@@ -1350,9 +1339,7 @@ int s_client_main(int argc, char **argv)
             max_version = DTLS1_VERSION;
             socket_type = SOCK_DGRAM;
             isdtls = 1;
-# ifndef OPENSS_NO_QUIC
             isquic = 0;
-# endif
 #endif
             break;
         case OPT_DTLS1_2:
@@ -1362,9 +1349,7 @@ int s_client_main(int argc, char **argv)
             max_version = DTLS1_2_VERSION;
             socket_type = SOCK_DGRAM;
             isdtls = 1;
-# ifndef OPENSS_NO_QUIC
             isquic = 0;
-# endif
 #endif
             break;
         case OPT_QUIC:
@@ -2183,6 +2168,9 @@ int s_client_main(int argc, char **argv)
     if (tfo)
         BIO_printf(bio_c_out, "Connecting via TFO\n");
  re_start:
+    /* peer_addr might be set from previous connections */
+    BIO_ADDR_free(peer_addr);
+    peer_addr = NULL;
     if (init_client(&sock, host, port, bindhost, bindport, socket_family,
                     socket_type, protocol, tfo, !isquic, &peer_addr) == 0) {
         BIO_printf(bio_err, "connect:errno=%d\n", get_last_socket_error());
@@ -2268,7 +2256,7 @@ int s_client_main(int argc, char **argv)
 #ifndef OPENSSL_NO_QUIC
     if (isquic) {
         sbio = BIO_new_dgram(sock, BIO_NOCLOSE);
-        if (!SSL_set_initial_peer_addr(con, peer_addr)) {
+        if (!SSL_set1_initial_peer_addr(con, peer_addr)) {
             BIO_printf(bio_err, "Failed to set the initial peer address\n");
             goto shut;
         }
@@ -2985,10 +2973,13 @@ int s_client_main(int argc, char **argv)
             } while (!write_ssl
                      && cbuf_len == 0
                      && user_data_has_data(&user_data));
-            if (cbuf_len > 0)
+            if (cbuf_len > 0) {
                 read_tty = 0;
-            else
+                timeout.tv_sec = 0;
+                timeout.tv_usec = 0;
+            } else {
                 read_tty = 1;
+            }
         }
 
         ssl_pending = read_ssl && SSL_has_pending(con);
@@ -3185,7 +3176,7 @@ int s_client_main(int argc, char **argv)
                 }
             }
 #endif
-            k = SSL_read(con, sbuf, 1024 /* BUFSIZZ */ );
+            k = SSL_read(con, sbuf, BUFSIZZ);
 
             switch (SSL_get_error(con, k)) {
             case SSL_ERROR_NONE:
@@ -3282,6 +3273,7 @@ int s_client_main(int argc, char **argv)
                 ret = 0;
                 goto shut;
             }
+
             if (i > 0 && !user_data_add(&user_data, i)) {
                 ret = 0;
                 goto shut;
@@ -3495,6 +3487,7 @@ static void print_stuff(BIO *bio, SSL *s, int full)
     c = SSL_get_current_cipher(s);
     BIO_printf(bio, "%s, Cipher is %s\n",
                SSL_CIPHER_get_version(c), SSL_CIPHER_get_name(c));
+    BIO_printf(bio, "Protocol: %s\n", SSL_get_version(s));
     if (peer != NULL) {
         EVP_PKEY *pktmp;
 
@@ -3810,7 +3803,7 @@ static void user_data_init(struct user_data_st *user_data, SSL *con, char *buf,
 
 static int user_data_add(struct user_data_st *user_data, size_t i)
 {
-    if (user_data->buflen != 0 || i > user_data->bufmax - 1)
+    if (user_data->buflen != 0 || i > user_data->bufmax)
         return 0;
 
     user_data->buflen = i;

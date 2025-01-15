@@ -1,5 +1,5 @@
 /*
- * Copyright 2019-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2019-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -140,6 +140,8 @@ static const struct trace_category_st
     TRACE_CATEGORY_(ENCODER),
     TRACE_CATEGORY_(REF_COUNT),
     TRACE_CATEGORY_(HTTP),
+    TRACE_CATEGORY_(PROVIDER),
+    TRACE_CATEGORY_(QUERY),
 }; /* KEEP THIS LIST IN SYNC with #define OSSL_TRACE_CATEGORY_... in trace.h */
 
 const char *OSSL_trace_get_category_name(int num)
@@ -475,7 +477,7 @@ BIO *OSSL_trace_begin(int category)
     char *prefix = NULL;
 
     category = ossl_trace_get_category(category);
-    if (category < 0)
+    if (category < 0 || !OSSL_trace_enabled(category))
         return NULL;
 
     channel = trace_channels[category].bio;
@@ -502,7 +504,7 @@ BIO *OSSL_trace_begin(int category)
     return channel;
 }
 
-void OSSL_trace_end(int category, BIO * channel)
+void OSSL_trace_end(int category, BIO *channel)
 {
 #ifndef OPENSSL_NO_TRACE
     char *suffix = NULL;

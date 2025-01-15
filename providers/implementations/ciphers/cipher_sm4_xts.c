@@ -1,6 +1,6 @@
 
 /*
- * Copyright 2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2022-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -205,7 +205,7 @@ static int sm4_xts_set_ctx_params(void *vxctx, const OSSL_PARAM params[])
     PROV_SM4_XTS_CTX *xctx = (PROV_SM4_XTS_CTX *)vxctx;
     const OSSL_PARAM *p;
 
-    if (params == NULL)
+    if (ossl_param_is_empty(params))
         return 1;
 
     /*-

@@ -1,5 +1,5 @@
 /*
- * Copyright 1995-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2024 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -330,7 +330,7 @@ static int def_load_bio(CONF *conf, BIO *in, long *line)
 
         v = NULL;
         /* check for line continuation */
-        if (bufnum >= 1) {
+        if (!again && bufnum >= 1) {
             /*
              * If we have bytes and the last char '\\' and second last char
              * is not '\\'
@@ -892,7 +892,7 @@ static BIO *get_next_file(const char *path, OPENSSL_DIR_CTX **dirctx)
 
 static int is_keytype(const CONF *conf, char c, unsigned short type)
 {
-    const unsigned short * keytypes = (const unsigned short *) conf->meth_data;
+    const unsigned short *keytypes = (const unsigned short *) conf->meth_data;
     unsigned char key = (unsigned char)c;
 
 #ifdef CHARSET_EBCDIC

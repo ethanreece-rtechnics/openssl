@@ -1,11 +1,13 @@
 /*
- * Copyright 1995-2021 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 1995-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
  * in the file LICENSE in the source distribution or at
  * https://www.openssl.org/source/license.html
  */
+
+#include "internal/e_os.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -156,8 +158,6 @@ static void tracedata_free(tracedata *data)
     BIO_free_all(data->bio);
     OPENSSL_free(data);
 }
-
-static STACK_OF(tracedata) *trace_data_stack;
 
 static void cleanup_trace(void)
 {
@@ -446,12 +446,12 @@ static int do_cmd(LHASH_OF(FUNCTION) *prog, int argc, char *argv[])
     return 1;
 }
 
-static int function_cmp(const FUNCTION * a, const FUNCTION * b)
+static int function_cmp(const FUNCTION *a, const FUNCTION *b)
 {
     return strncmp(a->name, b->name, 8);
 }
 
-static unsigned long function_hash(const FUNCTION * a)
+static unsigned long function_hash(const FUNCTION *a)
 {
     return OPENSSL_LH_strhash(a->name);
 }

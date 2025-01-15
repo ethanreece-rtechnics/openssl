@@ -1,5 +1,5 @@
 /*
- * Copyright 2006-2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2006-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -111,7 +111,7 @@ static int ecdh_cms_set_peerkey(EVP_PKEY_CTX *pctx,
     if (p == NULL || plen == 0)
         goto err;
 
-    if (!EVP_PKEY_set1_encoded_public_key(pkpeer, p, plen))
+    if (EVP_PKEY_set1_encoded_public_key(pkpeer, p, plen) <= 0)
         goto err;
 
     if (EVP_PKEY_derive_set_peer(pctx, pkpeer) > 0)

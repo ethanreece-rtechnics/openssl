@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 The OpenSSL Project Authors. All Rights Reserved.
+ * Copyright 2022-2023 The OpenSSL Project Authors. All Rights Reserved.
  *
  * Licensed under the Apache License 2.0 (the "License").  You may not use
  * this file except in compliance with the License.  You can obtain a copy
@@ -21,6 +21,7 @@
 #include "crypto/decoder.h"
 #include "crypto/ctype.h"        /* ossl_isdigit() */
 #include "prov/implementations.h"
+#include "prov/providercommon.h"
 #include "prov/bio.h"
 #include "file_store_local.h"
 #ifdef __CYGWIN__
@@ -119,7 +120,7 @@ static int winstore_set_ctx_params(void *loaderctx, const OSSL_PARAM params[])
     const OSSL_PARAM *p;
     int do_reset = 0;
 
-    if (params == NULL)
+    if (ossl_param_is_empty(params))
         return 1;
 
     p = OSSL_PARAM_locate_const(params, OSSL_STORE_PARAM_PROPERTIES);
